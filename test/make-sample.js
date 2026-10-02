@@ -1,6 +1,8 @@
 /*
  * 生成一个“演示用”小端 PCAP：samples/demo.pcap
- * 内含一条 TCP 连接，故意覆盖：握手、乱序、相同重传、字节冲突、缺口、snaplen 截断。
+ * 同一对端点（192.168.1.10:40000 <-> 93.184.216.34:8080）先后建立【两次 TCP 会话】
+ * （端口复用），并故意覆盖：握手、乱序、相同重传、字节冲突、缺口、
+ * 正常 FIN 关闭、RST 复位，以及两次会话之间夹杂的无关帧（ARP）。
  * 运行：node test/make-sample.js
  */
 'use strict';
@@ -11,7 +13,7 @@ const GLOBAL_HEADER = Buffer.from([
   0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00,
   0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0x00, 0x00, 0x01, 0, 0, 0
 ]);
-const FLAGS = { FIN: 0x01, SYN: 0x02, ACK: 0x10, PSH: 0x08 };
+const FLAGS = { FIN: 0x01, SYN: 0x02, RST: 0x04, ACK: 0x10, PSH: 0x08 };
 
 function tcp(seq, ack, flags, payload, sp = 40000, dp = 8080) {
   const b = Buffer.alloc(20 + payload.length);
@@ -79,10 +81,30 @@ records.push(pkt(ISN_S + 1, ISN_C + 20, FLAGS.PSH | FLAGS.ACK, resp.slice(0, 8),
 records.push(pkt(ISN_S + 1 + 12, ISN_C + 20, FLAGS.ACK, resp.slice(12, 40), false)); // 跳过 8..12 => 缺口
 records.push(pkt(ISN_S + 1 + 40, ISN_C + 20, FLAGS.ACK, resp.slice(40), false));
 
-// 一个非 IPv4 帧（EtherType ARP 0x0806），展示“未纳入重组”
+// 会话 1 正常关闭：客户端先 FIN（半关闭），服务端再 FIN。
+const C_FIN_SEQ = ISN_C + 1 + req.length; // 1023
+const S_FIN_SEQ = ISN_S + 1 + resp.length; // 7061
+records.push(pkt(C_FIN_SEQ, S_FIN_SEQ, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), true));
+records.push(pkt(S_FIN_SEQ, C_FIN_SEQ + 1, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), false));
+records.push(pkt(C_FIN_SEQ + 1, S_FIN_SEQ + 1, FLAGS.ACK, Buffer.alloc(0), true));
+
+// 一个非 IPv4 帧（EtherType ARP 0x0806）夹在两次会话之间：展示“未纳入重组”与并发连接隔离
 const arpFrame = Buffer.alloc(42);
 arpFrame[12] = 0x08; arpFrame[13] = 0x06;
 records.push(rec(arpFrame));
+
+// ---- 会话 2：同一对 IP:port 端口复用，全新 ISN；最终被 RST 异常复位 ----
+const ISN2_C = 50000, ISN2_S = 80000;
+records.push(pkt(ISN2_C, 0, FLAGS.SYN, Buffer.alloc(0), true));
+records.push(pkt(ISN2_S, ISN2_C + 1, FLAGS.SYN | FLAGS.ACK, Buffer.alloc(0), false));
+records.push(pkt(ISN2_C + 1, ISN2_S + 1, FLAGS.ACK, Buffer.alloc(0), true));
+
+const req2 = Buffer.from('POST /again HTTP/1.0\r\n\r\n-second-session-');
+records.push(pkt(ISN2_C + 1, ISN2_S + 1, FLAGS.PSH | FLAGS.ACK, req2, true)); // 34B
+const resp2 = Buffer.from('second session response (must not merge with the first)'); // 55B
+records.push(pkt(ISN2_S + 1, ISN2_C + 1 + req2.length, FLAGS.PSH | FLAGS.ACK, resp2, false));
+// 会话 2 被 RST 复位（服务端发起）
+records.push(pkt(ISN2_S + 1 + resp2.length, ISN2_C + 1 + req2.length, FLAGS.RST | FLAGS.ACK, Buffer.alloc(0), false));
 
 const outDir = path.join(__dirname, '..', 'samples');
 fs.mkdirSync(outDir, { recursive: true });

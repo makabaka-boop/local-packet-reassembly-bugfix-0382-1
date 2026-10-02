@@ -172,6 +172,12 @@ body {
 .tag.retrans { background: rgba(76,195,138,.18); color: var(--ok); }
 .tag.conflict { background: rgba(255,93,77,.18); color: var(--conflict); }
 .tag.snap { background: rgba(224,163,64,.18); color: var(--warn); }
+.tag.sess { background: rgba(77,163,255,.20); color: var(--accent); }
+.tag.state-closed_fin { background: rgba(76,195,138,.16); color: var(--ok); }
+.tag.state-reset { background: rgba(229,96,77,.16); color: var(--err); }
+.tag.state-superseded { background: rgba(224,163,64,.16); color: var(--warn); }
+.tag.state-open { background: rgba(138,151,165,.16); color: var(--muted); }
+.ano-card.session-event { border-color: var(--accent-dim); background: rgba(77,163,255,.07); }
 
 .gap-card, .conflict-card, .ano-card {
   border: 1px solid var(--border);

@@ -203,7 +203,8 @@
     ui.exportBtn.disabled = false;
     ui.exportTextBtn.disabled = false;
     setStatus(
-      '解析完成：' + model.packetTotal + ' 个包，' + model.tcpConnectionCount + ' 条 TCP 连接' +
+      '解析完成：' + model.packetTotal + ' 个包，' + model.tcpConnectionCount + ' 条 TCP 流' +
+      '（' + model.endpointPairCount + ' 对端点；同一端点对复用端口的多次会话已拆分为独立流）' +
       (model.truncated ? '；解析在文件尾部提前停止（见提示）' : '') + '。冻结快照：' +
       session.snapshot.snapshotId
     );
@@ -228,21 +229,33 @@
     else renderEmptyConn();
   }
 
-  // ---- 连接列表 ----
+  // ---- 流（TCP 会话）列表 ----
+  const SESSION_STATE_LABEL = {
+    open: '进行中/未见关闭',
+    closed_fin: '正常关闭 (FIN)',
+    reset: 'RST 复位',
+    superseded: '被新会话取代（未见关闭）'
+  };
+
   function renderConnectionList() {
     const model = session.model;
-    ui.connCount.textContent = model.connections.length;
+    ui.connCount.textContent = model.tcpConnectionCount;
     ui.connList.innerHTML = '';
     model.connections.forEach((conn, i) => {
       const li = document.createElement('li');
       li.className = 'conn-item' + (i === selectedConn ? ' active' : '');
       const dA = conn.directionAtoB;
       const dB = conn.directionBtoA;
+      const reused = conn.sessionCountInTuple > 1;
+      const stateLabel = SESSION_STATE_LABEL[conn.state] || conn.state;
       li.innerHTML =
         '<div class="ep">' + escapeHtml(conn.endpointA.key) + ' ↔ ' + escapeHtml(conn.endpointB.key) + '</div>' +
-        '<div class="meta">' + conn.packetCount + ' 包' +
-        ' · A→B ' + dA.coveredBytes + 'B/' + dA.gaps.length + '缺/' + dA.conflicts.length + '冲突' +
-        ' · B→A ' + dB.coveredBytes + 'B/' + dB.gaps.length + '缺/' + dB.conflicts.length + '冲突' +
+        '<div class="meta">' +
+          (reused ? '<span class="tag sess">会话 ' + conn.sessionOrdinal + '/' + conn.sessionCountInTuple + '</span> ' : '') +
+          '<span class="tag state-' + conn.state + '">' + stateLabel + '</span> ' +
+          conn.packetCount + ' 包' +
+          ' · A→B ' + dA.coveredBytes + 'B/' + dA.gaps.length + '缺/' + dA.conflicts.length + '冲突' +
+          ' · B→A ' + dB.coveredBytes + 'B/' + dB.gaps.length + '缺/' + dB.conflicts.length + '冲突' +
         '</div>';
       li.addEventListener('click', () => selectConnection(i));
       ui.connList.appendChild(li);
@@ -276,7 +289,10 @@
   function renderConnection() {
     const conn = currentConnection();
     if (!conn) return renderEmptyConn();
-    ui.connTitle.textContent = conn.endpointA.key + '  ↔  ' + conn.endpointB.key;
+    const sessLabel = conn.sessionCountInTuple > 1
+      ? '  ·  会话 ' + conn.sessionOrdinal + ' / ' + conn.sessionCountInTuple
+      : '';
+    ui.connTitle.textContent = conn.endpointA.key + '  ↔  ' + conn.endpointB.key + sessLabel;
     ui.dirAtoB.textContent = 'A → B  (' + conn.endpointA.key + '  →  ' + conn.endpointB.key + ')';
     ui.dirBtoA.textContent = 'B → A  (' + conn.endpointB.key + '  →  ' + conn.endpointA.key + ')';
     ui.dirAtoB.classList.toggle('active', selectedDir === 'AtoB');
@@ -404,8 +420,8 @@
       return;
     }
     ui.anomaliesView.innerHTML = all
-      .map((a) => '<div class="ano-card">' +
-        (a.type ? '<span class="tag conflict">' + escapeHtml(a.type) + '</span> ' : '') +
+      .map((a) => '<div class="ano-card' + (a.sessionEvent ? ' session-event' : '') + '">' +
+        (a.type ? '<span class="tag ' + (a.sessionEvent ? 'sess' : 'conflict') + '">' + escapeHtml(a.type) + '</span> ' : '') +
         escapeHtml(a.message) + '</div>')
       .join('');
   }
@@ -506,7 +522,9 @@
     const header =
       '# 导出自冻结快照 ' + session.snapshot.snapshotId + '\n' +
       '# 文件: ' + session.fileName + '\n' +
-      '# 连接: ' + conn.key + '\n' +
+      '# 连接: ' + conn.key +
+      (conn.sessionCountInTuple > 1 ? '  (会话 ' + conn.sessionOrdinal + '/' + conn.sessionCountInTuple + ')' : '') + '\n' +
+      '# 状态: ' + conn.state + '\n' +
       '# 方向: ' + selectedDir + '\n' +
       '# 缺口已以 ␠[...] 显式标注，未做任何填充\n\n';
     const blob = new Blob([header + d.text], { type: 'text/plain;charset=utf-8' });
