@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>本地小端 PCAP · TCP 重组查看器（限定版）</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <strong>本地 PCAP 重组查看器</strong>
+      <span class="badge">限定版 · ≤ 8 MB / ≤ 2000 包 · 仅小端经典 PCAP · 以太网 / IPv4 / TCP</span>
+    </div>
+    <div class="actions">
+      <label class="btn primary" id="pickLabel">
+        选择文件
+        <input type="file" id="fileInput" accept=".pcap,application/vnd.tcpdump.pcap" hidden />
+      </label>
+      <button class="btn" id="cancelBtn" disabled>取消</button>
+      <button class="btn" id="exportBtn" disabled>导出冻结结果 (JSON)</button>
+      <button class="btn" id="exportTextBtn" disabled>导出当前文本</button>
+    </div>
+  </header>
+
+  <div id="dropZone" class="dropzone">
+    <p>把 <code>.pcap</code> 文件拖到此处，或点击右上角“选择文件”。</p>
+    <p class="hint">文件只在本浏览器内由 Web Worker 解析，<strong>不会上传到任何服务器</strong>。</p>
+  </div>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main id="main" class="layout hidden">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>TCP 连接 (<span id="connCount">0</span>)</span>
+      </div>
+      <ul id="connList" class="conn-list"></ul>
+      <div class="sidebar-foot">
+        <button class="linklike" id="unclassifiedToggle">未纳入重组的包 (<span id="uncCount">0</span>)</button>
+      </div>
+    </aside>
+
+    <section class="content">
+      <div class="conn-header">
+        <div id="connTitle" class="conn-title"></div>
+        <div id="connStats" class="conn-stats"></div>
+      </div>
+
+      <div class="direction-switch">
+        <button class="dir-btn active" data-dir="AtoB" id="dirAtoB">A → B</button>
+        <button class="dir-btn" data-dir="BtoA" id="dirBtoA">B → A</button>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="packets">包</button>
+        <button class="tab" data-tab="gaps">缺口</button>
+        <button class="tab" data-tab="conflicts">冲突</button>
+        <button class="tab" data-tab="text">重组文本</button>
+        <button class="tab" data-tab="hex">十六进制</button>
+        <button class="tab" data-tab="anomalies">异常</button>
+      </nav>
+
+      <div class="tabpanels">
+        <div class="panel active" data-panel="packets">
+          <table class="grid">
+            <thead>
+              <tr>
+                <th>#</th><th>相对时间(s)</th><th>标志</th><th>原始seq</th><th>相对seq</th>
+                <th>ack</th><th>载荷字节</th><th>重传去重</th><th>冲突字节</th><th>备注</th>
+              </tr>
+            </thead>
+            <tbody id="packetsBody"></tbody>
+          </table>
+        </div>
+
+        <div class="panel" data-panel="gaps">
+          <div id="gapsView"></div>
+        </div>
+
+        <div class="panel" data-panel="conflicts">
+          <div id="conflictsView"></div>
+        </div>
+
+        <div class="panel" data-panel="text">
+          <pre id="textView" class="textview"></pre>
+        </div>
+
+        <div class="panel" data-panel="hex">
+          <div class="hex-legend">
+            <span><i class="sw conflict"></i> 字节冲突位置</span>
+            <span id="hexCapNote" class="hint"></span>
+          </div>
+          <pre id="hexView" class="hexview"></pre>
+        </div>
+
+        <div class="panel" data-panel="anomalies">
+          <div id="anomaliesView"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section id="uncPanel" class="unc-panel hidden">
+    <div class="unc-head">
+      <strong>未纳入 TCP 重组的包</strong>
+      <button class="linklike" id="unclassifiedClose">收起</button>
+    </div>
+    <table class="grid">
+      <thead>
+        <tr><th>#</th><th>相对时间(s)</th><th>捕获长度</th><th>原因（层 / 说明）</th></tr>
+      </thead>
+      <tbody id="uncBody"></tbody>
+    </table>
+  </section>
+
+  <footer class="footer">
+    <span id="statusLine">就绪。</span>
+    <span class="hint">
+      建议通过本地静态服务器打开（<code>python3 -m http.server</code> 后访问
+      <code>http://localhost:8000/</code>），部分浏览器的 Worker 不支持 file://。
+    </span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
