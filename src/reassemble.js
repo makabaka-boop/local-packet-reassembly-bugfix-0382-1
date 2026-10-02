@@ -3,6 +3,8 @@
  *
  * 核心原则（对应需求）：
  *   - 按双向四元组归并连接，每个方向独立重组；
+ *   - 同一四元组被复用（先后多次 TCP 会话）时，依据连接生命周期证据拆分为
+ *     多个会话实例，每个会话独立重组，绝不把两次传输拼成一条流；
  *   - 相同字节的重传重叠去重（不重复计数、不伪造内容）；
  *   - 缺失区间显式留空（gap），绝不拿后到字节填补成“看起来连续”的流；
  *   - 重叠位置字节不一致 => 标记 conflict；展示保留“文件中先捕获”的字节，
@@ -16,6 +18,18 @@
  *   1) 展开序号后排序，求覆盖区间的并集 -> runs（缺口即 run 之间的空间）；
  *   2) 按“文件捕获顺序”把每个字节落到 run 上：首见者占有位置，
  *      相同重叠计重传去重，不同则记冲突与双方证据。
+ *
+ * 会话拆分（同四元组复用）只依据序号与标志位事实，不猜测：
+ *   - 新 SYN（不带 ACK）且与本会话同方向已有 SYN 的 ISN 不同，或会话已越过
+ *     纯 SYN 阶段 => 新会话；同 ISN 的 SYN 是重传，双向 SYN 属同时打开，均不拆；
+ *   - SYN+ACK 的 ISN 与本会话不符、且其 ack 也未确认本会话的 SYN => 新会话；
+ *   - 会话已关闭（任一方向 RST，或双向 FIN）后，序号不落在已覆盖区间内的包
+ *     => 新会话；完全落在已覆盖区间内的包是旧会话的迟到重传，仍归旧会话；
+ *   - 本方向 FIN 之后又出现越过 FIN 序号位的数据（同一连接不可能）=> 新会话；
+ *   - 数据序号落在本方向 ISN 之前（同一连接不可能）=> 新会话；
+ *   - 当前会话解释不了、但某个更早会话能完整覆盖/容纳的包（迟到重传、迟到
+ *     控制包），归回其来源会话，不污染当前会话的冲突/缺口证据；
+ *   - 每个 TCP 包恰好归属一个会话；拆分依据随会话保存并进入导出。
  *
  * 可被 Worker 与 Node 测试同时加载。
  */
@@ -79,6 +93,34 @@
       this.isnRaw = null; // SYN 的 ISN（展示用）
       this.finSeq = null; // FIN 在数据之后占用的序号（原始 32 位）
       this.anomalies = [];
+      // ---- 会话拆分 / 归属判定用的增量状态（与 finalize 同一套展开规则）----
+      this.synSeqs = []; // 本方向所有 SYN 类包的原始 seq（识别同 ISN 重传）
+      this.ackValues = new Set(); // 本方向 ACK 包的 ack 值（跨方向核验 SYN 归属）
+      this.hiRaw = 0; // 水位：已到达最高字节【段尾】的原始 32 位 seq
+      this.hiExp = 0; // 水位对应的展开位置（最高字节的下一个位置）
+      this.loExp = null; // 已到达数据段的最低展开起点
+      this.finSeen = false;
+      this.finExp = null; // FIN 占用序号位的展开位置
+      this.synWithPayload = false; // SYN 携带数据时数据可合法位于展开坐标 0
+    }
+
+    /**
+     * 按“最高字节水位（段尾）”规则计算 rawSeq 的展开起点，不修改状态。
+     *   fwd = (seq - hiRaw) mod 2^32：
+     *   fwd ≤ 2^31 => 前进 d=fwd（跨 0 回绕时 fwd 仍是小正数，天然连续）；
+     *   fwd > 2^31 => 乱序后到 d=fwd-2^32（start 落在已覆盖区，只重叠不覆盖）。
+     * 必须用段尾 (seq+len) 推进水位；若用段首，下一段 fwd 会少算本段长度，
+     * 在回绕边界产生 off-by-segment-length 错位。≤8MB 文件跨度远小于 2^31。
+     */
+    _walk(rawSeq) {
+      const fwd = (rawSeq - this.hiRaw) >>> 0;
+      const d = fwd <= HALF2 ? fwd : fwd - TWO32;
+      return { start: this.hiExp + d, d };
+    }
+
+    /** 假设段在当前水位下的展开起点；锚点未建立时返回 null。 */
+    walkStart(rawSeq) {
+      return this.anchorRaw === null ? null : this._walk(rawSeq).start;
     }
 
     addPacket(pkt) {
@@ -93,6 +135,11 @@
         snapTruncated: !!pkt.snapTruncated
       });
 
+      if (t.flags.ack) this.ackValues.add(t.ack >>> 0);
+      if (t.flags.syn) {
+        this.synSeqs.push(t.seq >>> 0);
+        if (t.payloadLen > 0) this.synWithPayload = true;
+      }
       if (t.flags.syn && this.isnRaw === null) this.isnRaw = t.seq;
 
       // 锚点只确定一次：优先首个 SYN 的 ISN；否则第一个数据段的 seq。
@@ -100,21 +147,48 @@
       if (this.anchorRaw === null && (t.flags.syn || t.payloadLen > 0)) {
         this.anchorRaw = t.seq;
         this.anchorPkt = pkt.index;
+        this.hiRaw = t.seq >>> 0;
+        this.hiExp = 0;
       }
 
       if (t.payloadLen > 0) {
+        // 展开坐标在加包时确定（捕获顺序与 finalize 的两遍算法一致）；
+        // 会话拆分判定与最终重组因此使用同一坐标系，证据不会自相矛盾。
+        const w = this._walk(t.seq);
+        if (w.d > 0 && t.seq < this.hiRaw) {
+          this.anomalies.push({
+            type: 'sequence_wrap',
+            pktIndex: pkt.index,
+            message: '包 #' + (pkt.index + 1) + ' 跨越 32 位序号回绕点（0x' +
+              (this.hiRaw >>> 0).toString(16) + ' → 0x' + (t.seq >>> 0).toString(16) +
+              '），回绕点前后的字节已连续展开，未产生虚假缺口。'
+          });
+        }
         this.segments.push({
           pktIndex: pkt.index,
           rawSeq: t.seq,
+          start: w.start,
           bytes: new Uint8Array(
             pkt._fileBuffer.buffer,
             pkt._fileBuffer.byteOffset + t.payloadStart,
             t.payloadLen
           )
         });
+        if (this.loExp === null || w.start < this.loExp) this.loExp = w.start;
+        const segEnd = w.start + t.payloadLen;
+        if (segEnd > this.hiExp) {
+          this.hiRaw = (t.seq + t.payloadLen) >>> 0; // 水位推进到段尾
+          this.hiExp = segEnd;
+        }
       }
 
-      if (t.flags.fin) this.finSeq = (t.seq + Math.max(0, t.payloadLen)) >>> 0;
+      if (t.flags.fin) {
+        this.finSeq = (t.seq + Math.max(0, t.payloadLen)) >>> 0;
+        this.finSeen = true;
+        // FIN 占用的序号位（数据之后的一个位置）的展开坐标；用于判定
+        // “FIN 之后又有越过它的数据”这一同一连接内不可能的事件。
+        this.finExp = this.anchorRaw === null ? null : this._walk(this.finSeq).start;
+      }
     }
 
     finalize() {
@@ -124,43 +198,15 @@
       const relBase = 0;
 
       // ---- 展开 32 位序号（同时正确处理回绕 / 乱序 / 缺口）----
-      // 按捕获顺序维护“已到达最高字节水位”，且水位以【段尾】表示：
-      //   hiExp = 已到达最高字节的下一个展开位置；hiRaw = 其原始 32 位 seq。
-      // 对新段取 fwd = (seq - hiRaw) mod 2^32：
-      //   fwd ≤ 2^31 => 前进 d=fwd（跨 0 回绕时 fwd 仍是小正数，天然连续）；
-      //   fwd > 2^31 => 乱序后到 d=fwd-2^32（start 落在已覆盖区，只重叠不覆盖）。
-      //   start = hiExp + d。
-      // 回绕点两侧因此无缝；回绕后若还缺字节，fwd 跳过空缺使 run 并集自然留空。
-      // 必须用段尾 (seq+len) 推进水位；若用段首，下一段 fwd 会少算本段长度，
-      // 在回绕边界产生 off-by-segment-length 错位。≤8MB 文件跨度远小于 2^31。
-      const startBySeg = new Map();
-      let hiRaw = anchor;
-      let hiExp = 0;
-      for (const s of this.segments) {
-        const fwd = (s.rawSeq - hiRaw) >>> 0;
-        const d = fwd <= HALF2 ? fwd : fwd - TWO32;
-        const start = hiExp + d;
-        if (d > 0 && s.rawSeq < hiRaw) {
-          this.anomalies.push({
-            type: 'sequence_wrap',
-            pktIndex: s.pktIndex,
-            message: '包 #' + (s.pktIndex + 1) + ' 跨越 32 位序号回绕点（0x' +
-              (hiRaw >>> 0).toString(16) + ' → 0x' + (s.rawSeq >>> 0).toString(16) +
-              '），回绕点前后的字节已连续展开，未产生虚假缺口。'
-          });
-        }
-        startBySeg.set(s, start);
-        const segEnd = start + s.bytes.length;
-        if (segEnd > hiExp) {
-          hiRaw = (s.rawSeq + s.bytes.length) >>> 0; // 水位推进到段尾
-          hiExp = segEnd;
-        }
-      }
-
-      const segs = this.segments.map((s) => {
-        const start = startBySeg.get(s);
-        return { pktIndex: s.pktIndex, rawSeq: s.rawSeq, start, end: start + s.bytes.length, bytes: s.bytes };
-      });
+      // 各数据段的展开起点已在 addPacket 时按捕获顺序用同一水位规则确定，
+      // 这里直接取用；拆分判定所见的状态与最终重组结果因此严格一致。
+      const segs = this.segments.map((s) => ({
+        pktIndex: s.pktIndex,
+        rawSeq: s.rawSeq,
+        start: s.start,
+        end: s.start + s.bytes.length,
+        bytes: s.bytes
+      }));
 
       for (const s of segs) {
         if (s.end - s.start >= HALF2 || s.start <= -HALF2) {
@@ -319,7 +365,7 @@
       // 纯控制段（如 SYN/ACK）用同一水位规则独立展开，仅用于展示。
       const segStartByPkt = new Map();
       for (const s of this.segments) {
-        if (!segStartByPkt.has(s.pktIndex)) segStartByPkt.set(s.pktIndex, startBySeg.get(s));
+        if (!segStartByPkt.has(s.pktIndex)) segStartByPkt.set(s.pktIndex, s.start);
       }
       const packetEntries = this.packets.map((p) => {
         const st = pktStats.get(p.pktIndex) || { retransmitBytes: 0, conflictBytes: 0 };
@@ -369,13 +415,200 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // 同四元组会话拆分
+  //
+  // 每个四元组维护一个按捕获顺序增长的会话序列；每个 TCP 包依据序号与
+  // 标志位事实归属到恰好一个会话。只在有硬证据时拆分，绝不凭启发式猜测：
+  // 没有握手、没有关闭、序号也不矛盾时，包仍留在当前会话（缺口/冲突照实展示）。
+  // ------------------------------------------------------------------
+
+  function hex8(n) {
+    return '0x' + (n >>> 0).toString(16).padStart(8, '0');
+  }
+
+  /** 数据段 [seq, seq+len) 是否完全落在该方向已覆盖区间 [loExp, hiExp] 内。 */
+  function fullyCovered(asm, seq, len) {
+    if (asm.anchorRaw === null || asm.loExp === null) return false;
+    const start = asm.walkStart(seq);
+    return start >= asm.loExp && start + len <= asm.hiExp;
+  }
+
+  /** 数据段是否与已覆盖区间相邻或重叠（边沿扩展、乱序、重传都算）。 */
+  function touchesWindow(asm, seq, len) {
+    if (asm.anchorRaw === null || asm.loExp === null) return false;
+    const start = asm.walkStart(seq);
+    return start <= asm.hiExp + 1 && start + len >= asm.loExp;
+  }
+
+  /** 纯控制包（无载荷）的序号位是否落在该方向已用序号空间 [lo, hi+1] 内。 */
+  function fitsControlWindow(asm, seq) {
+    if (asm.anchorRaw === null) return false;
+    const pos = asm.walkStart(seq);
+    const lo = asm.loExp !== null ? asm.loExp : (asm.isnRaw !== null ? 1 : 0);
+    const hi = (asm.loExp !== null ? asm.hiExp : (asm.isnRaw !== null ? 1 : 0)) + 1;
+    return pos >= lo && pos <= hi;
+  }
+
+  /** 会话是否已关闭：任一方向 RST，或两个方向都见过 FIN。 */
+  function sessionClosed(sess) {
+    return sess.rstSeen || (sess.atob.finSeen && sess.btoa.finSeen);
+  }
+
+  /** 会话是否仍处于纯 SYN 阶段（迄今所有包都是不带 ACK 的 SYN）。 */
+  function sessionFresh(sess) {
+    return !sess.sawNonSynNoAck;
+  }
+
+  /** 对向已捕获的 ACK 是否确认过 synSeq+1（该 SYN 属于本会话的硬证据）。 */
+  function ackConsistent(sess, dirLabel, synSeq) {
+    const other = dirLabel === 'AtoB' ? sess.btoa : sess.atob;
+    return other.ackValues.has((synSeq + 1) >>> 0);
+  }
+
+  function dirAssembler(sess, dirLabel) {
+    return dirLabel === 'AtoB' ? sess.atob : sess.btoa;
+  }
+
+  function makeSession(tupleState, splitReason) {
+    const sess = {
+      sessionIndex: tupleState.sessions.length + 1,
+      atob: new DirectionAssembler('AtoB'),
+      btoa: new DirectionAssembler('BtoA'),
+      packetIndices: [],
+      rstSeen: false,
+      sawNonSynNoAck: false,
+      splitReason: splitReason || null // {type, pktIndex, message}
+    };
+    tupleState.sessions.push(sess);
+    return sess;
+  }
+
+  function startSession(tupleState, pkt, type, detail) {
+    return makeSession(tupleState, {
+      type,
+      pktIndex: pkt.index,
+      message: '包 #' + (pkt.index + 1) + ' ' + detail + '；自本包起拆分为该四元组的第 ' +
+        (tupleState.sessions.length + 1) + ' 个会话。'
+    });
+  }
+
+  /**
+   * 在当前会话解释不了 pkt 时，检查某个更早会话能否完整容纳它
+   * （迟到重传 / 迟到控制包应归回其来源会话，不污染当前会话的证据）。
+   */
+  function findOlderSession(tupleState, pkt, dirLabel) {
+    const t = pkt.tcp;
+    const sessions = tupleState.sessions;
+    for (let i = sessions.length - 2; i >= 0; i--) {
+      const asm = dirAssembler(sessions[i], dirLabel);
+      if (t.payloadLen > 0) {
+        if (fullyCovered(asm, t.seq, t.payloadLen)) return sessions[i];
+      } else if (fitsControlWindow(asm, t.seq)) {
+        return sessions[i];
+      }
+    }
+    return null;
+  }
+
+  /** 判定 pkt 归属的会话（必要时新建），返回会话对象。 */
+  function assignPacket(tupleState, pkt, dirLabel) {
+    const t = pkt.tcp;
+    let cur = tupleState.sessions[tupleState.sessions.length - 1];
+    if (!cur) return makeSession(tupleState, null);
+
+    const ds = dirAssembler(cur, dirLabel);
+    const ods = dirAssembler(cur, dirLabel === 'AtoB' ? 'BtoA' : 'AtoB');
+
+    // R1：SYN（不带 ACK）——新连接请求。
+    if (t.flags.syn && !t.flags.ack) {
+      if (ds.synSeqs.indexOf(t.seq >>> 0) !== -1) return cur; // 同 ISN：SYN 重传
+      // 纯 SYN 阶段且本方向尚无 SYN：首个 SYN，或同时打开的第二个 SYN。
+      if (sessionFresh(cur) && ds.synSeqs.length === 0) return cur;
+      // 对向 ACK 确认过该 ISN+1：原 SYN 漏抓、这是本会话自己的迟到 SYN。
+      if (ackConsistent(cur, dirLabel, t.seq)) return cur;
+      return startSession(tupleState, pkt, 'syn_new_isn',
+        '携带新的 SYN（ISN ' + hex8(t.seq) +
+        (ds.isnRaw !== null ? '，与本会话同方向 ISN ' + hex8(ds.isnRaw) + ' 不同' : '') +
+        '），同一四元组被复用');
+    }
+
+    // SYN+ACK：握手应答。ISN 与本会话不符且 ack 也不确认本会话的 SYN 时，
+    // 它是另一次连接的应答（其 SYN 可能漏抓）。
+    if (t.flags.syn && t.flags.ack) {
+      if (ds.synSeqs.indexOf(t.seq >>> 0) !== -1) return cur; // 同 ISN：重传
+      if (
+        sessionFresh(cur) && ds.packets.length === 0 && ods.synSeqs.length > 0 &&
+        (t.ack >>> 0) === ((ods.synSeqs[0] + 1) >>> 0)
+      ) {
+        return cur; // 正常握手应答（含同时打开的应答），ack 确认本会话的 SYN
+      }
+      if (ackConsistent(cur, dirLabel, t.seq)) return cur; // 对向已确认该 ISN+1
+      return startSession(tupleState, pkt, 'synack_new_isn',
+        '携带新的 SYN+ACK（ISN ' + hex8(t.seq) +
+        (ds.isnRaw !== null ? '，与本会话同方向 ISN ' + hex8(ds.isnRaw) + ' 不同' : '') +
+        '），且未确认本会话的 SYN，属于同一四元组的另一次连接');
+    }
+
+    // 以下均为非 SYN 包。
+    // R2：会话已关闭（RST 或双向 FIN）——只有落在已覆盖区间内的包才可能是
+    // 旧会话的迟到重传；其余一律属于新会话。
+    if (sessionClosed(cur)) {
+      const fits = t.payloadLen > 0
+        ? fullyCovered(ds, t.seq, t.payloadLen)
+        : fitsControlWindow(ds, t.seq);
+      if (fits) return cur;
+      const older = findOlderSession(tupleState, pkt, dirLabel);
+      if (older) return older;
+      return startSession(tupleState, pkt, 'after_close',
+        '出现在上一会话关闭（' + (cur.rstSeen ? 'RST' : '双向 FIN') + '）之后，' +
+        '且其序号不在上一会话已覆盖的序号空间内');
+    }
+
+    if (t.payloadLen > 0) {
+      // R2a：本方向 FIN 之后又出现越过 FIN 序号位的数据——同一连接不可能。
+      if (ds.finSeen && ds.finExp !== null) {
+        const start = ds.walkStart(t.seq);
+        if (start !== null && start + t.payloadLen > ds.finExp) {
+          const older = findOlderSession(tupleState, pkt, dirLabel);
+          if (older) return older;
+          return startSession(tupleState, pkt, 'data_after_fin',
+            '的数据越过本方向 FIN 占用的序号位（FIN 之后本方向不可能再有新数据）');
+        }
+      }
+      // R3：数据序号落在本方向 ISN 之前——同一连接不可能。
+      if (ds.isnRaw !== null) {
+        const start = ds.walkStart(t.seq);
+        const minPos = ds.synWithPayload ? 0 : 1;
+        if (start !== null && start < minPos) {
+          const older = findOlderSession(tupleState, pkt, dirLabel);
+          if (older) return older;
+          return startSession(tupleState, pkt, 'seq_before_isn',
+            '的数据序号落在本方向 ISN ' + hex8(ds.isnRaw) + ' 之前（同一连接不可能）');
+        }
+      }
+      // 迟到重传回属：当前会话的覆盖窗口碰不到它、但某个更早会话能完整覆盖。
+      if (!touchesWindow(ds, t.seq, t.payloadLen)) {
+        const older = findOlderSession(tupleState, pkt, dirLabel);
+        if (older) return older;
+      }
+    } else {
+      // 迟到控制包回属：序号位不在当前会话窗口内、但在某个更早会话窗口内。
+      if (!fitsControlWindow(ds, t.seq)) {
+        const older = findOlderSession(tupleState, pkt, dirLabel);
+        if (older) return older;
+      }
+    }
+    return cur;
+  }
+
   /**
    * 由 parse() 的结果构建完整重组模型。
    * @param {Object} parseResult
    * @param {Uint8Array} fileBuffer 原始字节（payload 为其上的视图，需要保活）
    */
   function buildModel(parseResult, fileBuffer) {
-    const connections = new Map();
+    const tuples = new Map(); // 归一化四元组 -> {sessions:[...]}
     const unclassified = [];
     let baseTs = null;
 
@@ -396,37 +629,48 @@
       const ordered = endpointOrder(epA0, epB0) <= 0 ? [epA0, epB0] : [epB0, epA0];
       const connKey = ordered[0].key + '<->' + ordered[1].key;
 
-      let conn = connections.get(connKey);
-      if (!conn) {
-        conn = {
+      let tupleState = tuples.get(connKey);
+      if (!tupleState) {
+        tupleState = {
           key: connKey,
           endpointA: ordered[0],
           endpointB: ordered[1],
-          atob: new DirectionAssembler('AtoB'),
-          btoa: new DirectionAssembler('BtoA'),
-          packetIndices: []
+          sessions: []
         };
-        connections.set(connKey, conn);
+        tuples.set(connKey, tupleState);
       }
-      const dir =
-        pkt.ip.srcIp === conn.endpointA.ip && pkt.tcp.srcPort === conn.endpointA.port
-          ? conn.atob
-          : conn.btoa;
-      dir.addPacket(pkt);
-      conn.packetIndices.push(pkt.index);
+      const dirLabel =
+        pkt.ip.srcIp === tupleState.endpointA.ip && pkt.tcp.srcPort === tupleState.endpointA.port
+          ? 'AtoB'
+          : 'BtoA';
+
+      // 归属判定只看该四元组自己的会话序列，其他连接的夹杂互不影响。
+      const sess = assignPacket(tupleState, pkt, dirLabel);
+      dirAssembler(sess, dirLabel).addPacket(pkt);
+      sess.packetIndices.push(pkt.index);
+      if (pkt.tcp.flags.rst) sess.rstSeen = true;
+      if (!(pkt.tcp.flags.syn && !pkt.tcp.flags.ack)) sess.sawNonSynNoAck = true;
     }
 
     const connList = [];
-    for (const conn of connections.values()) {
-      connList.push({
-        key: conn.key,
-        endpointA: conn.endpointA,
-        endpointB: conn.endpointB,
-        directionAtoB: conn.atob.finalize(),
-        directionBtoA: conn.btoa.finalize(),
-        packetCount: conn.packetIndices.length,
-        firstPktIndex: conn.packetIndices[0]
-      });
+    for (const tupleState of tuples.values()) {
+      const sessionCount = tupleState.sessions.length;
+      for (const sess of tupleState.sessions) {
+        connList.push({
+          key: tupleState.key + (sessionCount > 1 ? '#' + sess.sessionIndex : ''),
+          tupleKey: tupleState.key,
+          sessionIndex: sess.sessionIndex,
+          tupleSessionCount: sessionCount,
+          splitReason: sess.splitReason,
+          endpointA: tupleState.endpointA,
+          endpointB: tupleState.endpointB,
+          directionAtoB: sess.atob.finalize(),
+          directionBtoA: sess.btoa.finalize(),
+          packetCount: sess.packetIndices.length,
+          firstPktIndex: sess.packetIndices[0],
+          lastPktIndex: sess.packetIndices[sess.packetIndices.length - 1]
+        });
+      }
     }
     connList.sort((a, b) => a.firstPktIndex - b.firstPktIndex);
 

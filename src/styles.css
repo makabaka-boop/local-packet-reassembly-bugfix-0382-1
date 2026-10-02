@@ -140,6 +140,15 @@ body {
 .conn-stats b { color: var(--text); font-weight: 600; }
 .conn-stats .gap { color: var(--gap); }
 .conn-stats .conflict { color: var(--conflict); }
+.conn-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--warn);
+  background: rgba(224,163,64,.08);
+  border: 1px solid rgba(224,163,64,.35);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
 
 .direction-switch { display: flex; gap: 6px; padding: 8px 14px 0; }
 .dir-btn {

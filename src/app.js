@@ -31,6 +31,7 @@
     uncBody: el('uncBody'),
     connTitle: el('connTitle'),
     connStats: el('connStats'),
+    connNote: el('connNote'),
     dirAtoB: el('dirAtoB'),
     dirBtoA: el('dirBtoA'),
     packetsBody: el('packetsBody'),
@@ -240,7 +241,11 @@
       const dB = conn.directionBtoA;
       li.innerHTML =
         '<div class="ep">' + escapeHtml(conn.endpointA.key) + ' ↔ ' + escapeHtml(conn.endpointB.key) + '</div>' +
-        '<div class="meta">' + conn.packetCount + ' 包' +
+        '<div class="meta">' +
+        (conn.tupleSessionCount > 1
+          ? '会话 ' + conn.sessionIndex + '/' + conn.tupleSessionCount + ' · 自包 #' + (conn.firstPktIndex + 1) + ' 起 · '
+          : '') +
+        conn.packetCount + ' 包' +
         ' · A→B ' + dA.coveredBytes + 'B/' + dA.gaps.length + '缺/' + dA.conflicts.length + '冲突' +
         ' · B→A ' + dB.coveredBytes + 'B/' + dB.gaps.length + '缺/' + dB.conflicts.length + '冲突' +
         '</div>';
@@ -252,6 +257,8 @@
   function renderEmptyConn() {
     ui.connTitle.textContent = '没有可重组的 TCP 连接';
     ui.connStats.innerHTML = '';
+    ui.connNote.classList.add('hidden');
+    ui.connNote.textContent = '';
     ui.packetsBody.innerHTML = '';
     ['gapsView', 'conflictsView', 'anomaliesView'].forEach((v) => (el(v).innerHTML = ''));
     ui.textView.textContent = '';
@@ -276,7 +283,24 @@
   function renderConnection() {
     const conn = currentConnection();
     if (!conn) return renderEmptyConn();
-    ui.connTitle.textContent = conn.endpointA.key + '  ↔  ' + conn.endpointB.key;
+    ui.connTitle.textContent = conn.endpointA.key + '  ↔  ' + conn.endpointB.key +
+      (conn.tupleSessionCount > 1 ? '（同四元组会话 ' + conn.sessionIndex + '/' + conn.tupleSessionCount + '）' : '');
+    // 同四元组复用证据：会话序号、覆盖包范围与拆分依据，随会话固定展示。
+    const notes = [];
+    if (conn.tupleSessionCount > 1) {
+      notes.push(
+        '同一四元组在文件中被复用为 ' + conn.tupleSessionCount + ' 个会话；本会话覆盖包 #' +
+        (conn.firstPktIndex + 1) + ' – #' + (conn.lastPktIndex + 1) + '，每个包仅归属一个会话。'
+      );
+    }
+    if (conn.splitReason) notes.push('拆分依据：' + conn.splitReason.message);
+    if (notes.length) {
+      ui.connNote.innerHTML = notes.map(escapeHtml).join('<br>');
+      ui.connNote.classList.remove('hidden');
+    } else {
+      ui.connNote.classList.add('hidden');
+      ui.connNote.textContent = '';
+    }
     ui.dirAtoB.textContent = 'A → B  (' + conn.endpointA.key + '  →  ' + conn.endpointB.key + ')';
     ui.dirBtoA.textContent = 'B → A  (' + conn.endpointB.key + '  →  ' + conn.endpointA.key + ')';
     ui.dirAtoB.classList.toggle('active', selectedDir === 'AtoB');
@@ -507,6 +531,11 @@
       '# 导出自冻结快照 ' + session.snapshot.snapshotId + '\n' +
       '# 文件: ' + session.fileName + '\n' +
       '# 连接: ' + conn.key + '\n' +
+      (conn.tupleSessionCount > 1
+        ? '# 同四元组会话: ' + conn.sessionIndex + '/' + conn.tupleSessionCount +
+          '（包 #' + (conn.firstPktIndex + 1) + ' – #' + (conn.lastPktIndex + 1) + '）\n'
+        : '') +
+      (conn.splitReason ? '# 拆分依据: ' + conn.splitReason.message + '\n' : '') +
       '# 方向: ' + selectedDir + '\n' +
       '# 缺口已以 ␠[...] 显式标注，未做任何填充\n\n';
     const blob = new Blob([header + d.text], { type: 'text/plain;charset=utf-8' });

@@ -464,6 +464,327 @@ test('IP 分片（MF / 偏移）不参与重组', () => {
   assert.match(model.unclassified[0].ignored.reason, /分片/);
 });
 
+// ---------------- 同四元组多会话拆分 ----------------
+
+// 客户端 10.0.0.1:1111 -> 服务端 10.0.0.2:80 的便捷构造
+function cPkt(o) {
+  return tcpPkt(Object.assign({ srcIp: '10.0.0.1', srcPort: 1111, dstIp: '10.0.0.2', dstPort: 80 }, o));
+}
+function sPkt(o) {
+  return tcpPkt(Object.assign({ srcIp: '10.0.0.2', srcPort: 80, dstIp: '10.0.0.1', dstPort: 1111 }, o));
+}
+
+test('同四元组两次会话（FIN 正常关闭 + 新 SYN）：拆分，第二会话不计重传/冲突/缺口', () => {
+  tsCounter = 10000000;
+  const recs = [
+    // 会话 1：ISN_C=1000 / ISN_S=9000，双向 FIN 正常关闭
+    cPkt({ seq: 1000, flags: FLAGS.SYN }),
+    sPkt({ seq: 9000, ack: 1001, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 1001, ack: 9001, payload: Buffer.from('HELLO-1') }),
+    sPkt({ seq: 9001, ack: 1008, payload: Buffer.from('RSP1') }),
+    cPkt({ seq: 1008, ack: 9005, flags: FLAGS.FIN | FLAGS.ACK }),
+    sPkt({ seq: 9005, ack: 1009, flags: FLAGS.FIN | FLAGS.ACK }),
+    cPkt({ seq: 1009, ack: 9006, flags: FLAGS.ACK }),
+    // 会话 2：同四元组，全新 ISN
+    cPkt({ seq: 0x20000000, flags: FLAGS.SYN }),
+    sPkt({ seq: 0x60000000, ack: 0x20000001, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 0x20000001, ack: 0x60000001, payload: Buffer.from('HELLO-2') }),
+    sPkt({ seq: 0x60000001, ack: 0x20000008, payload: Buffer.from('RSP2') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2, '两次会话必须拆成两条连接');
+
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.tupleKey, '10.0.0.1:1111<->10.0.0.2:80');
+  assert.strictEqual(c1.sessionIndex, 1);
+  assert.strictEqual(c1.tupleSessionCount, 2);
+  assert.strictEqual(c2.sessionIndex, 2);
+  assert.strictEqual(c2.splitReason.type, 'syn_new_isn');
+  assert.match(c2.splitReason.message, /包 #8/);
+
+  // 各自方向独立重组：文本、缺口、冲突互不污染
+  assert.strictEqual(c1.directionAtoB.text, 'HELLO-1');
+  assert.strictEqual(c1.directionBtoA.text, 'RSP1');
+  assert.strictEqual(c2.directionAtoB.text, 'HELLO-2');
+  assert.strictEqual(c2.directionBtoA.text, 'RSP2');
+  for (const c of [c1, c2]) {
+    for (const d of [c.directionAtoB, c.directionBtoA]) {
+      assert.strictEqual(d.gaps.length, 0);
+      assert.strictEqual(d.conflicts.length, 0);
+      assert.ok(d.packets.every((p) => p.retransmitBytes === 0), '第二会话的字节不得计为重传');
+    }
+  }
+
+  // 包归属一致性：每个 TCP 包恰好属于一个会话
+  assert.strictEqual(c1.packetCount, 7);
+  assert.strictEqual(c2.packetCount, 4);
+  assert.strictEqual(c1.packetCount + c2.packetCount, model.packetTotal);
+  assert.deepStrictEqual(
+    c2.directionAtoB.packets.map((p) => p.pktIndex),
+    [7, 9],
+    '第二会话 A→B 只含自己的 SYN 与数据包'
+  );
+  assert.strictEqual(c1.directionAtoB.isnRaw, 1000);
+  assert.strictEqual(c2.directionAtoB.isnRaw, 0x20000000);
+});
+
+test('同四元组两次会话（RST 异常复位关闭）：第二会话 SYN 拆分', () => {
+  tsCounter = 10100000;
+  const recs = [
+    cPkt({ seq: 500, flags: FLAGS.SYN }),
+    sPkt({ seq: 8000, ack: 501, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 501, ack: 8001, payload: Buffer.from('FIRST') }),
+    cPkt({ seq: 506, ack: 8001, flags: FLAGS.RST | FLAGS.ACK }), // 异常复位
+    cPkt({ seq: 0x40000000, flags: FLAGS.SYN }), // 第二会话
+    sPkt({ seq: 0x70000000, ack: 0x40000001, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 0x40000001, ack: 0x70000001, payload: Buffer.from('SECOND') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  assert.strictEqual(model.connections[0].directionAtoB.text, 'FIRST');
+  assert.strictEqual(model.connections[1].directionAtoB.text, 'SECOND');
+  assert.strictEqual(model.connections[1].splitReason.type, 'syn_new_isn');
+  assert.strictEqual(model.connections[0].packetCount + model.connections[1].packetCount, model.packetTotal);
+});
+
+test('缺少握手包（抓包从数据开始）：第二会话 SYN 仍触发拆分', () => {
+  tsCounter = 10200000;
+  const recs = [
+    // 会话 1 的握手未抓到，只有数据与 FIN
+    cPkt({ seq: 5000, ack: 1, payload: Buffer.from('AAA') }),
+    cPkt({ seq: 5003, ack: 1, flags: FLAGS.FIN | FLAGS.ACK }),
+    // 会话 2 的握手完整
+    cPkt({ seq: 0x11111111, flags: FLAGS.SYN }),
+    cPkt({ seq: 0x11111112, ack: 1, payload: Buffer.from('BBB') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.directionAtoB.isnRaw, null, '第一会话未见 SYN');
+  assert.strictEqual(c1.directionAtoB.text, 'AAA');
+  assert.strictEqual(c2.directionAtoB.text, 'BBB');
+  assert.strictEqual(c2.directionAtoB.isnRaw, 0x11111111);
+  assert.strictEqual(c1.packetCount + c2.packetCount, model.packetTotal);
+});
+
+test('两次会话握手都缺失：FIN 关闭 + 序号不属于旧会话空间 => 拆分', () => {
+  tsCounter = 10300000;
+  const recs = [
+    // 会话 1：无握手，数据 + 双向 FIN
+    cPkt({ seq: 1000, ack: 2001, payload: Buffer.from('AAAA') }),
+    sPkt({ seq: 2000, ack: 1004, payload: Buffer.from('aaaa') }),
+    cPkt({ seq: 1004, ack: 2005, flags: FLAGS.FIN | FLAGS.ACK }),
+    sPkt({ seq: 2005, ack: 1005, flags: FLAGS.FIN | FLAGS.ACK }),
+    // 会话 2：握手同样缺失，全新序号空间
+    cPkt({ seq: 0x50000000, ack: 0x60000001, payload: Buffer.from('BBBB') }),
+    sPkt({ seq: 0x60000000, ack: 0x50000004, payload: Buffer.from('bbbb') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.directionAtoB.text, 'AAAA');
+  assert.strictEqual(c1.directionBtoA.text, 'aaaa');
+  assert.strictEqual(c2.directionAtoB.text, 'BBBB');
+  assert.strictEqual(c2.directionBtoA.text, 'bbbb');
+  assert.strictEqual(c2.splitReason.type, 'after_close');
+  assert.match(c2.splitReason.message, /关闭/);
+  assert.strictEqual(c1.packetCount + c2.packetCount, model.packetTotal);
+});
+
+test('单向片段（只抓到 A→B）：RST 关闭后新数据拆分；FIN 后越过 FIN 的数据拆分', () => {
+  tsCounter = 10400000;
+  // 情形 1：单向 + RST 关闭
+  let recs = [
+    cPkt({ seq: 100, flags: FLAGS.SYN }),
+    cPkt({ seq: 101, ack: 1, payload: Buffer.from('ONE') }),
+    cPkt({ seq: 104, ack: 1, flags: FLAGS.RST | FLAGS.ACK }),
+    cPkt({ seq: 0x90000000, ack: 1, payload: Buffer.from('TWO') }) // 新会话 SYN 漏抓
+  ];
+  let { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  assert.strictEqual(model.connections[0].directionAtoB.text, 'ONE');
+  assert.strictEqual(model.connections[1].directionAtoB.text, 'TWO');
+  assert.strictEqual(model.connections[1].splitReason.type, 'after_close');
+  assert.strictEqual(model.connections[1].directionBtoA.packetCount, 0, '单向片段对向无包');
+
+  // 情形 2：单向 + FIN，之后同方向出现越过 FIN 序号位的数据（同一连接不可能）
+  tsCounter = 10450000;
+  recs = [
+    cPkt({ seq: 100, flags: FLAGS.SYN }),
+    cPkt({ seq: 101, ack: 1, payload: Buffer.from('ONE') }),
+    cPkt({ seq: 104, ack: 1, flags: FLAGS.FIN | FLAGS.ACK }), // FIN 占序号位 4
+    cPkt({ seq: 200, ack: 1, payload: Buffer.from('TWO') }) // 展开坐标 99..102，越过 FIN
+  ];
+  ({ model } = buildFromBuf(buildPcap(recs)));
+  assert.strictEqual(model.connections.length, 2);
+  assert.strictEqual(model.connections[0].directionAtoB.text, 'ONE');
+  assert.strictEqual(model.connections[1].directionAtoB.text, 'TWO');
+  assert.strictEqual(model.connections[1].splitReason.type, 'data_after_fin');
+});
+
+test('数据序号落在本方向 ISN 之前（同一连接不可能）=> 拆分', () => {
+  tsCounter = 10500000;
+  const recs = [
+    cPkt({ seq: 1000, flags: FLAGS.SYN }),
+    cPkt({ seq: 1001, ack: 1, payload: Buffer.from('AAAA') }),
+    cPkt({ seq: 500, ack: 1, payload: Buffer.from('BB') }) // 新会话数据（SYN 漏抓），seq 在 ISN 之前
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  assert.strictEqual(model.connections[0].directionAtoB.text, 'AAAA');
+  assert.strictEqual(model.connections[1].directionAtoB.text, 'BB');
+  assert.strictEqual(model.connections[1].splitReason.type, 'seq_before_isn');
+});
+
+test('序号回绕 + 四元组复用：回绕不触发误拆分，两会话各自正确重组', () => {
+  tsCounter = 10600000;
+  const recs = [
+    // 会话 1：ISN 紧贴回绕点，数据跨 0xffffffff
+    cPkt({ seq: 0xfffffffe, flags: FLAGS.SYN }),
+    cPkt({ seq: 0xffffffff, ack: 1, payload: Buffer.from('ABCDE') }), // 占 seq ff..03
+    cPkt({ seq: 4, ack: 1, flags: FLAGS.FIN | FLAGS.ACK }),
+    sPkt({ seq: 8000, ack: 5, flags: FLAGS.FIN | FLAGS.ACK }), // 对向 FIN 使会话关闭
+    // 会话 2：同四元组新 ISN
+    cPkt({ seq: 0x00000010, flags: FLAGS.SYN }),
+    cPkt({ seq: 0x00000011, ack: 8001, payload: Buffer.from('XY') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2, '回绕不得误拆、复用必须拆');
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.directionAtoB.text, 'ABCDE');
+  assert.strictEqual(c1.directionAtoB.gaps.length, 0, '回绕处无缝');
+  assert.strictEqual(c2.directionAtoB.text, 'XY');
+  assert.strictEqual(c2.splitReason.type, 'syn_new_isn');
+});
+
+test('两次会话之间夹杂其他连接：拆分状态按四元组隔离', () => {
+  tsCounter = 10700000;
+  const recs = [
+    cPkt({ seq: 100, flags: FLAGS.SYN }),
+    cPkt({ seq: 101, ack: 1, payload: Buffer.from('X1') }),
+    // 另一个四元组的完整连接插在中间
+    tcpPkt({ seq: 777, flags: FLAGS.SYN, srcIp: '10.0.0.3', srcPort: 2000, dstIp: '10.0.0.4', dstPort: 3000 }),
+    tcpPkt({ seq: 778, ack: 1, payload: Buffer.from('YY'), srcIp: '10.0.0.3', srcPort: 2000, dstIp: '10.0.0.4', dstPort: 3000 }),
+    // 原四元组的第二会话
+    cPkt({ seq: 0x50000000, flags: FLAGS.SYN }),
+    cPkt({ seq: 0x50000001, ack: 1, payload: Buffer.from('X2') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 3, 'X 两会话 + Y 一会话');
+  const [x1, y, x2] = model.connections; // 按首包序号排序
+  assert.strictEqual(x1.directionAtoB.text, 'X1');
+  assert.strictEqual(y.directionAtoB.text, 'YY');
+  assert.strictEqual(y.tupleSessionCount, 1, '夹杂连接不受影响');
+  assert.strictEqual(x2.directionAtoB.text, 'X2');
+  assert.strictEqual(x2.splitReason.type, 'syn_new_isn');
+  assert.strictEqual(
+    model.connections.reduce((n, c) => n + c.packetCount, 0),
+    model.packetTotal,
+    '每个 TCP 包恰好归属一个会话'
+  );
+});
+
+test('第二会话期间迟到的第一会话重传/控制包：归回来源会话，不污染新会话证据', () => {
+  tsCounter = 10800000;
+  const recs = [
+    cPkt({ seq: 1000, flags: FLAGS.SYN }),
+    cPkt({ seq: 1001, ack: 1, payload: Buffer.from('ABCDEF') }),
+    // 第二会话开始（第一会话未见关闭）
+    cPkt({ seq: 0x20000000, flags: FLAGS.SYN }),
+    cPkt({ seq: 0x20000001, ack: 1, payload: Buffer.from('XYZ') }),
+    // 迟到的第一会话重传（相同字节）与迟到的第一会话 FIN
+    cPkt({ seq: 1001, ack: 1, payload: Buffer.from('ABCDEF') }),
+    cPkt({ seq: 1007, ack: 1, flags: FLAGS.FIN | FLAGS.ACK })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.packetCount, 4, '迟到的重传与 FIN 归回第一会话');
+  assert.strictEqual(c2.packetCount, 2);
+  assert.strictEqual(c1.directionAtoB.text, 'ABCDEF');
+  assert.strictEqual(c2.directionAtoB.text, 'XYZ');
+  // 重传统计记在来源会话；新会话无冲突、无缺口、无重传
+  assert.strictEqual(c1.directionAtoB.packets.find((p) => p.pktIndex === 4).retransmitBytes, 6);
+  assert.strictEqual(c2.directionAtoB.conflicts.length, 0);
+  assert.strictEqual(c2.directionAtoB.gaps.length, 0);
+  assert.ok(c2.directionAtoB.packets.every((p) => p.retransmitBytes === 0));
+  // 迟到的 FIN 归回第一会话后，第一会话方向状态一致（FIN 被记录）
+  assert.strictEqual(c1.directionAtoB.finSeq, 1007);
+});
+
+test('SYN 重传（同 ISN）与同时打开的双向 SYN：均不拆分', () => {
+  tsCounter = 10900000;
+  const recs = [
+    cPkt({ seq: 500, flags: FLAGS.SYN }),
+    cPkt({ seq: 500, flags: FLAGS.SYN }), // 同 ISN 重传
+    sPkt({ seq: 900, ack: 501, flags: FLAGS.SYN | FLAGS.ACK }),
+    sPkt({ seq: 900, ack: 501, flags: FLAGS.SYN | FLAGS.ACK }), // SYN+ACK 重传
+    cPkt({ seq: 501, ack: 901, payload: Buffer.from('ok') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 1);
+  assert.strictEqual(model.connections[0].directionAtoB.text, 'ok');
+  assert.strictEqual(model.connections[0].packetCount, 5);
+});
+
+test('半关闭：单方向 FIN 后对向继续传数据，不拆分；双向 FIN 后新 SYN 才拆分', () => {
+  tsCounter = 11000000;
+  const recs = [
+    cPkt({ seq: 100, flags: FLAGS.SYN }),
+    sPkt({ seq: 9000, ack: 101, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 101, ack: 9001, flags: FLAGS.FIN | FLAGS.ACK }), // A→B 方向关闭
+    sPkt({ seq: 9001, ack: 102, payload: Buffer.from('still-sending') }), // 半关闭：对向继续
+    sPkt({ seq: 9014, ack: 102, flags: FLAGS.FIN | FLAGS.ACK }), // 对向也关闭
+    cPkt({ seq: 0x30000000, flags: FLAGS.SYN }) // 新会话
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.directionBtoA.text, 'still-sending', '半关闭数据属于同一会话');
+  assert.strictEqual(c1.packetCount, 5);
+  assert.strictEqual(c2.packetCount, 1);
+});
+
+test('第二会话 SYN 漏抓但其 SYN+ACK 被捕获：新 ISN 的 SYN+ACK 触发拆分', () => {
+  tsCounter = 11100000;
+  const recs = [
+    cPkt({ seq: 100, flags: FLAGS.SYN }),
+    sPkt({ seq: 900, ack: 101, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 101, ack: 901, payload: Buffer.from('A1') }),
+    cPkt({ seq: 103, ack: 901, flags: FLAGS.FIN | FLAGS.ACK }),
+    sPkt({ seq: 901, ack: 104, flags: FLAGS.FIN | FLAGS.ACK }),
+    // 第二会话的 SYN 漏抓，SYN+ACK 带着新 ISN 出现
+    sPkt({ seq: 0x80000000, ack: 0x12345678, flags: FLAGS.SYN | FLAGS.ACK }),
+    sPkt({ seq: 0x80000001, ack: 0x12345678, payload: Buffer.from('B2') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  const [c1, c2] = model.connections;
+  assert.strictEqual(c1.directionAtoB.text, 'A1');
+  assert.strictEqual(c2.directionBtoA.text, 'B2');
+  assert.strictEqual(c2.splitReason.type, 'synack_new_isn');
+  assert.strictEqual(c2.directionBtoA.isnRaw, 0x80000000);
+});
+
+test('同四元组三次会话 + 失败连接尝试（仅 SYN）：各自独立归属', () => {
+  tsCounter = 11200000;
+  const recs = [
+    cPkt({ seq: 100, flags: FLAGS.SYN }),
+    cPkt({ seq: 101, ack: 1, payload: Buffer.from('S1') }),
+    cPkt({ seq: 103, ack: 1, flags: FLAGS.RST | FLAGS.ACK }), // 会话 1 复位
+    cPkt({ seq: 0x40000000, flags: FLAGS.SYN }), // 失败尝试：只有 SYN，无应答
+    cPkt({ seq: 0x50000000, flags: FLAGS.SYN }), // 换了新 ISN 重试 => 另一会话
+    cPkt({ seq: 0x50000001, ack: 1, payload: Buffer.from('S3') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 3);
+  assert.strictEqual(model.connections[0].directionAtoB.text, 'S1');
+  assert.strictEqual(model.connections[1].packetCount, 1, '失败尝试仅含自己的 SYN');
+  assert.strictEqual(model.connections[1].directionAtoB.isnRaw, 0x40000000);
+  assert.strictEqual(model.connections[2].directionAtoB.text, 'S3');
+  assert.strictEqual(model.connections[2].directionAtoB.isnRaw, 0x50000000);
+});
+
 // ---------------- 运行 ----------------
 
 let pass = 0;

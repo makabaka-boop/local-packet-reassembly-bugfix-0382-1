@@ -1,6 +1,10 @@
 /*
  * 生成一个“演示用”小端 PCAP：samples/demo.pcap
- * 内含一条 TCP 连接，故意覆盖：握手、乱序、相同重传、字节冲突、缺口、snaplen 截断。
+ * 内含：
+ *   - 一条完整 TCP 连接（握手、乱序、相同重传、字节冲突、缺口、snaplen 截断）；
+ *   - 同一四元组复用的第二次会话（FIN 关闭后新 ISN 重连，RST 收尾）；
+ *   - 两次会话之间夹杂的另一条连接（验证拆分状态按四元组隔离）；
+ *   - 一个非 IPv4 帧（展示“未纳入重组”）。
  * 运行：node test/make-sample.js
  */
 'use strict';
@@ -83,6 +87,36 @@ records.push(pkt(ISN_S + 1 + 40, ISN_C + 20, FLAGS.ACK, resp.slice(40), false));
 const arpFrame = Buffer.alloc(42);
 arpFrame[12] = 0x08; arpFrame[13] = 0x06;
 records.push(rec(arpFrame));
+
+// ---- 会话 1 正常关闭（双向 FIN + 末尾 ACK）----
+// 客户端已发 22 字节（seq 1001..1022），服务端已发 60 字节（seq 7001..7060）
+records.push(pkt(ISN_C + 1 + 22, ISN_S + 1 + 60, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), true));
+records.push(pkt(ISN_S + 1 + 60, ISN_C + 1 + 23, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), false));
+records.push(pkt(ISN_C + 1 + 23, ISN_S + 1 + 61, FLAGS.ACK, Buffer.alloc(0), true));
+
+// ---- 两次会话之间夹杂的另一条连接（不同四元组）----
+const other = (seq, ack, flags, body, fromA) =>
+  rec(
+    eth(
+      fromA
+        ? ip('10.9.0.5', '10.9.0.6', tcp(seq, ack, flags, body, 51000, 443))
+        : ip('10.9.0.6', '10.9.0.5', tcp(seq, ack, flags, body, 443, 51000))
+    )
+  );
+records.push(other(31337, 0, FLAGS.SYN, Buffer.alloc(0), true));
+records.push(other(80000, 31338, FLAGS.SYN | FLAGS.ACK, Buffer.alloc(0), false));
+records.push(other(31338, 80001, FLAGS.ACK, Buffer.from('interleaved connection'), true));
+
+// ---- 同一四元组复用的第二次会话：新 ISN 重连，RST 异常收尾 ----
+const ISN_C2 = 0x20000010, ISN_S2 = 0x60000020;
+records.push(pkt(ISN_C2, 0, FLAGS.SYN, Buffer.alloc(0), true));
+records.push(pkt(ISN_S2, ISN_C2 + 1, FLAGS.SYN | FLAGS.ACK, Buffer.alloc(0), false));
+records.push(pkt(ISN_C2 + 1, ISN_S2 + 1, FLAGS.ACK, Buffer.alloc(0), true));
+const req2 = Buffer.from('GET /second HTTP/1.0\r\n\r\n'); // 24 字节
+records.push(pkt(ISN_C2 + 1, ISN_S2 + 1, FLAGS.PSH | FLAGS.ACK, req2, true));
+const resp2 = Buffer.from('SECOND SESSION RESPONSE (same 4-tuple)');
+records.push(pkt(ISN_S2 + 1, ISN_C2 + 1 + req2.length, FLAGS.PSH | FLAGS.ACK, resp2, false));
+records.push(pkt(ISN_C2 + 1 + req2.length, ISN_S2 + 1 + resp2.length, FLAGS.RST | FLAGS.ACK, Buffer.alloc(0), true));
 
 const outDir = path.join(__dirname, '..', 'samples');
 fs.mkdirSync(outDir, { recursive: true });
